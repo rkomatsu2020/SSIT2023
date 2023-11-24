@@ -12,11 +12,13 @@ from Utils.DataParser.get_data_loader import get_test_loader, InputFetcher
 from Utils.DataParser.set_dataset_path import set_dataset_path
 from Utils.ModelParser.model_parser import set_and_get_save_dir, load_model
 
+from SSIT.Model.net import Generator
+from SSIT.config import model_setting
+
 class Test():
-    def __init__(self, gpu_no, dataset_name, model_config, target_domain=None):
+    def __init__(self, gpu_no, dataset_name, model_config):
         self.base_dir = os.path.dirname(__file__)
         self.device = 'cuda:{}'.format(gpu_no) if torch.cuda.is_available() else 'cpu'
-        self.target_domain = target_domain
         self.model_name = model_config['model_name']
         self.dataset_name = dataset_name
         self.img_size = model_config['img_size']['default'] if dataset_name not in model_config['img_size'].keys() else model_config['img_size'][dataset_name]
@@ -29,17 +31,17 @@ class Test():
         self.lambda_cyc = float(model_config['lambda_cyc'][cyc_weight])
         self.lambda_style = float(model_config['lambda_style'][style_weight])
         # Get trained dir
-        if target_domain is None:
-            self.trained_model_dir = set_and_get_save_dir(self.model_name,
-                                                            '@trained_with_{}(c={} s={} a={})'.format(dataset_name, self.lambda_cyc, self.lambda_style, self.lambda_adv)
-                                                            )
-        else:
-            self.trained_model_dir = set_and_get_save_dir(self.model_name,
-                                                            '@trained_with_{} from {}'.format(target_domain, dataset_name)
-                                                            )
+        self.trained_model_dir = set_and_get_save_dir(self.model_name,
+                                                        '@trained_with_{}(c={} s={} a={})'.format(dataset_name, self.lambda_cyc, self.lambda_style, self.lambda_adv)
+                                                        )
+
         # Init loader & model
         self.has_loader = False
         self.loaded_trained_model = False
+        # Set Generator
+        img_size_config = 'default' if dataset_name not in model_setting['img_size'] else dataset_name
+        img_size = model_setting['img_size'][img_size_config]
+        self.netG = Generator(img_size=img_size, input_ch=3).to(self.device)
 
     def init_loader(self):
         # Sample Num
@@ -47,17 +49,15 @@ class Test():
         # Set test data loader
         dataset = set_dataset_path(self.dataset_name, is_train=False)
         source_loader, self.src_transform = get_test_loader(root=dataset['source'], which='source', batch_size=self.sample_num, target_domain_dic=None, img_size=self.img_size)
-        ref_loader, _ = get_test_loader(root=dataset['ref'], which='reference', batch_size=self.sample_num, target_domain_dic=None, target_domain_name=self.target_domain, img_size=self.img_size)
+        ref_loader, _ = get_test_loader(root=dataset['ref'], which='reference', batch_size=self.sample_num, img_size=self.img_size)
         self.test_loader = InputFetcher(loader=source_loader, loader_ref=ref_loader,
                                         mode='test', device=self.device)
         # Get domain name info
         self.target_domain_dic = dataset['target_label_dic']
         self.target_name_dic = dataset['target_name_dic']
         self.content_domain_num = dataset['content_num']
-        if self.target_domain is None:
-            self.target_domain_num = len(self.target_domain_dic)
-        else:
-            self.target_domain_num = 1
+        self.target_domain_num = len(self.target_domain_dic)
+
 
     def imshow(self, img, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), save_img_path=None, plt_imshow=True):
         npimg = img.data.cpu()

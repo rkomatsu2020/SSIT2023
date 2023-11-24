@@ -6,7 +6,7 @@ if __name__ == "__main__":
     # Environment
     parser.add_argument("-gpu", "--gpu_no", default=0, type=int, help="Set gpu no")
     parser.add_argument("-epoch", "--n_epoch", default=50, type=int, help="Set N epoch")
-    parser.add_argument("-bn", "--batch_size", default=10, type=int, help="Set Batch size")
+    parser.add_argument("-bn", "--batch_size", default=5, type=int, help="Set Batch size")
     parser.add_argument("-interval", "--save_interval", default=5, type=int, help="Set the epoch of save interval")
     parser.add_argument("-resume", "--resume_epoch", default=None, type=int, help="Set the epoch to restart")
     # Dataset
