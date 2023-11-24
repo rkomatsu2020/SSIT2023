@@ -4,7 +4,6 @@ sys.path.append(pathlib.Path(__file__).resolve().parents[0].as_posix())
 sys.path.append(pathlib.Path(__file__).resolve().parents[1].as_posix())
 sys.path.append(pathlib.Path(__file__).resolve().parents[2].as_posix())
 
-
 import os
 import torch
 import torch.nn as nn
@@ -19,7 +18,7 @@ from SSIT.Model.net import Generator, Discriminator
 from SSIT.Model.vgg import VGG19
 from SSIT.Model.loss import *
 from SSIT.config import model_setting
-from SSIT.test import TestSSIT
+from test_Guided_Trans import Test
 
 
 class TrainSSIT():
@@ -37,7 +36,7 @@ class TrainSSIT():
         img_size_config = 'default' if dataset_name not in model_setting['img_size'].keys() else dataset_name
         img_size = model_setting['img_size'][img_size_config]
 
-        dataset = set_dataset_path(dataset_name, is_train=True, kargs=kargs["dataset_op"])
+        dataset = set_dataset_path(dataset_name, is_train=True)
         source_loader = get_train_loader(root=dataset['source'], which='source', img_size=img_size,
                                          batch_size=self.batch_size, target_domain_dic=dataset['target_label_dic'], 
                                          k_shot=None, pad_crop=model_setting['pad_crop'])
@@ -57,7 +56,6 @@ class TrainSSIT():
         self.lambda_adv = float(model_setting['lambda_adv'][adv_weight])
         self.lambda_cyc = float(model_setting['lambda_cyc'][cyc_weight])
         self.lambda_style = float(model_setting['lambda_style'][style_weight])
-        self.lambda_gp = 10.0 
         self.unrolled_steps = model_setting['unroll_steps']
         # About save model path
         self.trained_models_dir_path = set_and_get_save_dir(self.model_name,
@@ -80,37 +78,64 @@ class TrainSSIT():
         self.scheduler_D = torch.optim.lr_scheduler.MultiStepLR(optimizer=self.optimizer_D, milestones=[self.total_iter//2, self.total_iter//4*3], gamma=0.1)
         # Set loss
         self.VGG_Loss = VGGLoss(self.device, VGG19())
-        self.Adv_Loss = GANLoss(loss=nn.MSELoss(), device=self.device)
+        self.Adv_Loss = GANLoss(loss=nn.MSELoss(), device=self.device, domain_num=self.domain_num)
         self.Style_Loss = nn.L1Loss()
+        self.Cls_Loss = nn.CrossEntropyLoss()
         # Set test
-        self.test = TestSSIT(gpu_no=gpu_no, dataset_name=dataset_name, domain_num=self.domain_num)
+        self.test = Test(gpu_no=gpu_no, dataset_name=dataset_name, model_config=model_setting)
 
     @staticmethod
     def get_trainable_params(dataset_name: str, style_domain_num: int, content_domain_num:int):
         from torchinfo import summary
         import contextlib
+        from thop import profile
+
+        def get_MB_from_params(params):
+            params_B = params * 4
+            params_kB = params_B/ 1024
+            params_MB = params_kB / 1024
+            return params_MB
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         img_size_config = 'default' if dataset_name not in model_setting['img_size'] else dataset_name
         img_size = model_setting['img_size'][img_size_config]
         target_domain_num = style_domain_num
+        rnd_input_size = (1, 3, img_size[0], img_size[1])
+        input1 = torch.randn(rnd_input_size).to(device)
+        input2 = torch.randn(rnd_input_size).to(device)
 
         netG = Generator(img_size=img_size, input_ch=3).to(device)
         netD = Discriminator(img_size=img_size, input_ch=3, domain_num=target_domain_num).to(device)
+        # Get Flops & params
+        netG_flops, netG_params = profile(netG, inputs=(input1, input2))
+        netG_params = get_MB_from_params(netG_params)
         # Print params (netG)
         netG_param_txt = "{}-params(netG) for {}.txt".format(model_setting["model_name"], dataset_name)
         with open(netG_param_txt, "a") as f:
             with contextlib.redirect_stdout(f):
-                summary(netG, input_size=[(1, 3, img_size[0], img_size[1]), (1, 3, img_size[0], img_size[1])])
+                print("Generator 1 ----------------------------------------------------")
+                summary(netG, input_size=[rnd_input_size, rnd_input_size], dtypes=[torch.float, torch.float])
                 print("\n")
+                print("================================================================")
+
+            f.write("Flops: {}\n".format(netG_flops))
+            f.write("Total Model Params(MB): {}\n".format(netG_params))
 
         # Print params (netD)
+        netD_flops, netD_params = profile(netD, inputs=(input1, ))
+        netD_params = get_MB_from_params(netD_params)
         netD_param_txt = "{}-params(netD) for {}.txt".format(model_setting["model_name"], dataset_name)
         with open(netD_param_txt, "a") as f:
             with contextlib.redirect_stdout(f):
-                summary(netD, input_size=[(1, 3, img_size[0], img_size[1]), (1, 1)], dtypes=[torch.float, torch.long])
+                print("Discriminator 1 ------------------------------------------------")
+                summary(netD, input_size=[rnd_input_size], dtypes=[torch.float])
                 print("\n")
+                print("================================================================")
+
+            f.write("Flops: {}\n".format(netD_flops))
+            f.write("Total Model Params(MB): {}\n".format(netD_params))
+
 
     def set_train_mode(self):
         model_list = [self.netG, self.netD]
@@ -187,17 +212,18 @@ class TrainSSIT():
         # Generate fake img
         A2B = self.netG(A, B)
         # Discriminate
-        pred_fake = self.netD(input=A2B, c=B_domain)
-        pred_real = self.netD(input=B, c=B_domain)
+        pred_fake = self.netD(input=A2B)
         lossG['Adv_Fake'] = self.Adv_Loss(pred_fake.adv_patch, True) * self.lambda_adv
         lossG['Adv_Fake(CAM)'] = self.Adv_Loss(pred_fake.cam_logit, True) * self.lambda_adv
+        lossG['Adv_Fake(Cls)'] = self.Cls_Loss(pred_fake.pred_class, B_domain)
 
+        pred_real = self.netD(input=B)
         sum_feat_loss = 0
         for idx, (fake_feats, real_feats) in enumerate(zip(pred_fake.feats, pred_real.feats)):
             for fake, real in zip(fake_feats, real_feats):
                 feat_loss = self.Style_Loss(fake, real.detach())
                 sum_feat_loss += feat_loss
-        lossG['Style_Feat'] = sum_feat_loss / (self.netD.netD_num) * self.lambda_style
+        lossG['Style_Feat'] = sum_feat_loss * self.lambda_style
 
         lossG['Content_Feat(VGG)'] = self.VGG_Loss(A2B, A, 'content') * self.lambda_cyc
         
@@ -221,13 +247,14 @@ class TrainSSIT():
         with torch.no_grad():
             A2B = self.netG(A, B)
         # Discriminate
-        pred_real = self.netD(input=B, c=B_domain)
-        pred_fake = self.netD(input=A2B.detach(), c=B_domain)
+        pred_real = self.netD(input=B)
+        pred_fake = self.netD(input=A2B.detach())
 
         lossD['Adv_Real'] = self.Adv_Loss(pred_real.adv_patch, True) * self.lambda_adv
         lossD['Adv_Fake'] = self.Adv_Loss(pred_fake.adv_patch, False) * self.lambda_adv
         lossD['Adv_Real(CAM)'] = self.Adv_Loss(pred_real.cam_logit, True) * self.lambda_adv
         lossD['Adv_Fake(CAM)'] = self.Adv_Loss(pred_fake.cam_logit, False) * self.lambda_adv
+        lossD['Adv_Real(Cls)'] = self.Cls_Loss(pred_real.pred_class, B_domain)
 
         loss = sum(lossD.values())
         loss.backward()
@@ -244,8 +271,3 @@ class TrainSSIT():
             nn.init.normal_(m.weight.data, 0.0, 0.02)
             if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.constant_(m.bias.data, 0.0)
-
-    
-if __name__ == "__main__":
-    t = TrainSSIT()
-    t()
