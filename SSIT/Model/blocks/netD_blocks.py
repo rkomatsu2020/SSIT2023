@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-from SSIT.Model.blocks.basic_blocks import *
+from SSIT.Model.blocks.basic_blocks import Conv2dBlock, ActFirstResBlock, ResBlock
 
 
 class ActConvDown(nn.Module):
@@ -30,7 +30,8 @@ class ActConvDown(nn.Module):
         self.conv1x1 = Conv2dBlock(input_ch=crr_dim*2, output_ch=crr_dim, kernel_size=1, stride=1, act="lrelu", use_spectral=False, act_first=True, act_inplace=False)
         self.cam_lambda = nn.Parameter(torch.zeros(1))
         # Output conv
-        self.netD["out"] = nn.Sequential(*[nn.LeakyReLU(0.2, False), nn.Conv2d(crr_dim, domain_num, 4, 1, 0)])
+        self.netD["out"] = nn.Sequential(*[nn.LeakyReLU(0.2, False), nn.Conv2d(crr_dim, 1, 4, 1, 0)])
+        self.output_dim = crr_dim
 
     def get_cam_logit(self, x):
         x0 = x.clone()
@@ -51,7 +52,7 @@ class ActConvDown(nn.Module):
 
         return cam_logit, out
 
-    def forward(self, x, c):
+    def forward(self, x):
         feats = list()
         h = x.clone()
 
@@ -66,8 +67,8 @@ class ActConvDown(nn.Module):
         # Append patch
         out = self.netD["out"](h)
         # Select by c
-        idx = torch.LongTensor(range(c.size(0))).to(x.device)
-        out = out[idx, c]     
+        #idx = torch.LongTensor(range(c.size(0))).to(x.device)
+        #out = out[idx, c]
 
-        return Munch(feats=feats, cam_out=cam_out, 
-                     out=out)
+        return Munch(feats=feats, cam_out=F.sigmoid(cam_out), 
+                     out=F.sigmoid(out))
