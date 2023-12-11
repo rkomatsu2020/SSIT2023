@@ -1,2 +1,0 @@
-from Eval.FID.fid_score import Output_FID_Scores_with_Guided_Translation
-from Eval.KID.kid_score import Output_KID_Scores_with_Guided_Translation
