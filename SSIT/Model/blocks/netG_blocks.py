@@ -44,7 +44,7 @@ class DirectNorm2d(nn.Module):
 # Encoder -------------------------------------------------
 class DownBlock(nn.Module):
     def __init__(self, input_ch: int, output_ch: int, k: int, s:int, p:int,
-                 act: str='lrelu', norm: str="in"):
+                 act: str=None, norm: str="in"):
         super().__init__()
 
         self.input_ch = input_ch
@@ -53,7 +53,7 @@ class DownBlock(nn.Module):
         self.noise = GaussianNoise(input_ch)
         self.conv = Conv2dBlock(input_ch=input_ch, output_ch=output_ch, kernel_size=k, stride=s, padding=p,
                                 norm=norm, act=act, act_inplace=False, act_first=True)
-        self.act = get_act(act)
+        self.act = nn.PReLU()
         self.norm = get_norm(norm, output_ch)
 
         
@@ -82,23 +82,30 @@ class UpResBlock(nn.Module):
         hidden_ch = input_ch if hidden_ch is None else hidden_ch
 
         self.noise0 = GaussianNoise(input_ch)
-        self.noise1 = GaussianNoise(hidden_ch)
         # CNN
-        self.conv0 =  Conv2dBlock(input_ch, hidden_ch, 3, 1, 1, pad_type='reflect', norm=None, act=None)
+        if self.upsample is True:
+            self.conv0 =  Conv2dBlock(input_ch//4, hidden_ch, 3, 1, 1, pad_type='reflect', norm=None, act=None)
+        else:
+            self.conv0 =  Conv2dBlock(input_ch, hidden_ch, 3, 1, 1, pad_type='reflect', norm=None, act=None)
         self.conv1 = Conv2dBlock(hidden_ch, output_ch, 3, 1, 1, pad_type='reflect', norm=None, act=None)
 
         if self.learned_shortcut is True:
-            self.conv_s = Conv2dBlock(input_ch, output_ch, 1, 1, 0, pad_type='reflect', norm=None, act=None)
-
+            if self.upsample is True:
+                self.conv_s = Conv2dBlock(input_ch//4, output_ch, 1, 1, 0, pad_type='reflect', norm=None, act=None)
+            else:
+                self.conv_s = Conv2dBlock(input_ch, output_ch, 1, 1, 0, pad_type='reflect', norm=None, act=None)
         # BatchNorm
-        self.norm0 = DirectNorm2d(input_ch, img_size=img_size)
+        if self.upsample is True:
+            self.norm0 = DirectNorm2d(input_ch//4, img_size=img_size)
+        else:
+            self.norm0 = DirectNorm2d(input_ch, img_size=img_size)
         self.norm1 = DirectNorm2d(hidden_ch, img_size=img_size)
         # Act
-        self.act0 = get_act(act)
-        self.act1 = get_act(act)
+        self.act0 = nn.PReLU()
+        self.act1 = nn.PReLU()
         # Upsample
         if self.upsample is True:
-            self.up = nn.Upsample(scale_factor=2)
+            self.up = nn.PixelShuffle(upscale_factor=2)
 
     def shortcut(self, x):
         if self.upsample is True:
@@ -114,16 +121,13 @@ class UpResBlock(nn.Module):
     def forward(self, x, ref):
         x_s = self.shortcut(x)
 
-        h = self.noise0(x)
-        h = self.norm0(h, style=ref)
+        if self.upsample is True:
+            x = self.up(x)
+
+        h = self.norm0(x, style=ref)
         h = self.act0(h)
         h = self.conv0(h)
         
-
-        if self.upsample is True:
-            h = self.up(h)
-
-        h = self.noise1(h)
         h = self.norm1(h, style=ref)
         h = self.act1(h)
         h = self.conv1(h)

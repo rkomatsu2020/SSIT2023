@@ -111,3 +111,38 @@ class VGGLoss(nn.Module):
             return self.calc_content_loss(x, y)
         elif mode == 'style':
             return self.calc_style_loss(x, y)
+
+def gradient_penalty(y, x):
+    weight = torch.ones(y.size()).to(y.device)
+    dydx = torch.autograd.grad(outputs=y,
+                               inputs=x,
+                               grad_outputs=weight,
+                               retain_graph=True,
+                               create_graph=True,
+                               only_inputs=True)[0]
+    dydx = dydx.view(dydx.size(0), -1)
+    dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
+    return torch.mean((dydx_l2norm-1)**2)
+
+class StyleMeanStdLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.criterion = nn.MSELoss()
+
+    def forward(self, x, y):
+        x_mean, x_std = self.calc_mean_std(x)
+        y_mean, y_std = self.calc_mean_std(y)
+
+        mean_loss = self.criterion(x_mean, y_mean)
+        std_loss = self.criterion(x_std, y_std)
+
+        return mean_loss + std_loss
+
+    def calc_mean_std(self, x, eps=1e-8):
+        B, C, H, W = x.size()
+        x_mean = x.view(B, C, -1).mean(dim=2).view(B, C, 1, 1)
+
+        x_var = x.view(B, C, -1).var(dim=2) + eps
+        x_std = torch.sqrt(x_var).view(B, C, 1, 1)
+
+        return x_mean, x_std

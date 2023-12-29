@@ -3,7 +3,7 @@ model_setting = {
     'model_name': 'SSIT',
     'lambda_adv': {'default':1.0},
     'lambda_cyc': {'default':1.0, 'photo2art':1.0, 'BDD100K_weather&time':1.0},
-    'lambda_style': {'default':5.0},
+    'lambda_style': {'default':1.5},
 
     'k_shot': None,
     'img_size': {'default':(256, 256), 

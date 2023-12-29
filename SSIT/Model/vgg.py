@@ -6,7 +6,7 @@ class VGG19(nn.Module):
     def __init__(self):
         super().__init__()
         # Initialize
-        self.content = [8, 13, 22, 31]
+        self.content = [13, 22, 31]
         # Load pretrained VGG
         # memo -------------------------------------
         # conv1_1:0, conv1_2:2, conv2_1:5, conv2_2:7 conv3_1:10, conv3_2:12, conv3_3:14, conv3_4:16

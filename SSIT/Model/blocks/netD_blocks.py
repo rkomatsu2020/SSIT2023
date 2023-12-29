@@ -19,8 +19,10 @@ class ActConvDown(nn.Module):
         for j in range(1, self.n_layers):
             output_dim = min(crr_dim*2, 256)
             #self.netD["norm_{}".format(j)] = DirectNorm2d(num_features=crr_dim)
-            self.netD["conv_{}".format(j)] = ActFirstResBlock(input_ch=crr_dim, output_ch=output_dim, 
-                                                              act="lrelu", act_inplace=False, downsample=True, use_spectral=True)
+            #self.netD["conv_{}".format(j)] = ActFirstResBlock(input_ch=crr_dim, output_ch=output_dim, 
+            #                                                  act="lrelu", act_inplace=False, downsample=True, use_spectral=True)
+            self.netD["conv_{}".format(j)] = Conv2dBlock(input_ch=crr_dim, output_ch=output_dim, kernel_size=3, stride=2, padding=1,
+                                                              act="lrelu", act_inplace=False, use_spectral=True)
             
             
             crr_dim = output_dim
