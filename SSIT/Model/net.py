@@ -7,175 +7,122 @@ from einops.layers.torch import Rearrange
 
 from Utils import unnormalize
 from SSIT.Model.blocks.basic_blocks import Conv2dBlock
-from ..config import netG_params, netD_params
-from .blocks.netG_blocks import DownBlock, UpResBlock
-from .blocks.netD_blocks import ActConvDown
-
+from SSIT.config import netG_params, netD_params
+from SSIT.Model.blocks.netG_blocks import DownBlock, UpBlock
+from SSIT.Model.blocks.netD_blocks import ViTDiscriminator
 
 # Discriminator -------------------------------------------------
 class Discriminator(nn.Module):
-    def __init__(self, img_size, input_ch=3, domain_num=2):
+    def __init__(self, input_ch=3, **kargs):
         super().__init__()
-        self.img_size = img_size
-        base_dim=netD_params["base_dim"]
-        self.netD_num = netD_params["netD_num"]
-        self.n_layers = netD_params["n_layers"]
+        self.net = ViTDiscriminator(input_ch=input_ch, 
+                                    img_size=kargs["img_size"], domain_num=kargs["domain_num"])
 
-        self.netD_dict = nn.ModuleDict()
-        for i in range(1, self.netD_num+1):
-            self.netD_dict["netD_{}".format(i)] = ActConvDown(input_ch=input_ch, domain_num=domain_num,
-                                                              base_dim=base_dim, n_layers=self.n_layers)
-        netD_output_dim = self.netD_dict["netD_{}".format(self.netD_num)].output_dim
-        self.domain_fc = nn.Linear(netD_output_dim, domain_num)
+        self.apply(init_weights)
 
-    def downsample(self, input):
-        return F.avg_pool2d(input, kernel_size=3,
-                            stride=2, padding=[1, 1],
-                            count_include_pad=False)
-
-    def forward(self, input: torch.Tensor):
-        B = input.size(0)
-        # Get patch
-        feats = []
-        result_cam =[]
-        result_patch = []
-        for i in range(1, len(self.netD_dict)+1):
-            netD = self.netD_dict["netD_{}".format(i)]
-            h1 = input.clone()
-            if i>1:
-                h1 = self.downsample(h1)
-            netD_outputs = netD(x=h1)
-            
-            feats.append(netD_outputs.feats)
-            result_cam.append(netD_outputs.cam_out)
-            result_patch.append(netD_outputs.out)
-        # Get class
-        h = feats[-1][-1]
-        h = F.adaptive_avg_pool2d(h, 1)
-        out_cls = self.domain_fc(h.view(B, -1))
-
-        return Munch(feats=feats, cam_logit=result_cam, adv_patch=result_patch, pred_class=out_cls)
+    def forward(self, input: torch.Tensor, **kargs):
+        out = self.net(input, domain=kargs["domain"])
+        return Munch(adv_patch=out["patch"])
 
 
 # Generator ----------------------------------------------------------------
 class Generator(nn.Module):
-    def __init__(self, img_size, input_ch=3, patch_size: int=32):
+    def __init__(self, img_size:tuple, input_ch=3):
         super().__init__()
-        self.h, self.w = img_size
-        h_img_size, w_img_size = img_size
-
-        base_dim=netG_params["base_dim"]
-        max_dim = netG_params["base_dim"]*8
-        enc_dec_num = netG_params["enc_dim_num"]
-
-        self.h_img_resize = h_img_size
-        self.w_img_resize = w_img_size
-
+        enc_dim_list = netG_params["enc_dim"]
+        bottom_dim_list = netG_params["bottom_dim"]
+        dec_dim_list = netG_params["dec_dim"]
+        
         # Input
-        self.input_conv = DownBlock(input_ch=input_ch, output_ch=base_dim, k=7, s=1, p=3, act=None, norm=None)
+        self.input_conv = Conv2dBlock(input_ch, enc_dim_list[0], 
+                                      kernel_size=7, stride=1, padding=3, pad_type="reflect",
+                                      norm=None, act=None)
         # Encoder
         self.enc = nn.ModuleList()
-        enc_dim_list = [base_dim]
-        crr_dim = base_dim
-        for i in range(1, enc_dec_num):
-            output_dim = min(crr_dim*2, max_dim)
-            if crr_dim != output_dim:
-                self.enc.append(
-                    DownBlock(input_ch=crr_dim, output_ch=output_dim, k=3, s=2, p=1,
-                                act="lrelu", norm="in")
-                )
-                self.h_img_resize = self.h_img_resize // 2
-                self.w_img_resize = self.w_img_resize // 2
-            else:
-                self.enc.append(
-                    DownBlock(input_ch=crr_dim, output_ch=output_dim, k=3, s=1, p=1,
-                                act="lrelu", norm="in")
-                )
-            enc_dim_list.append(output_dim)
-            crr_dim = output_dim
+        self.enc_img_size = [img_size]
+        self.down_count = 0
+        for i in range(1, len(enc_dim_list)):
+            input_dim = enc_dim_list[i-1]
+            output_dim = enc_dim_list[i]
+            H, W = self.enc_img_size[-1]
 
-        style_dim = enc_dim_list[-1]
-        self.style_pooling = nn.ModuleDict(
-            {
-                'pool_1': nn.AvgPool2d(kernel_size=(3, 3)),
-                'pool_2': nn.AvgPool2d(kernel_size=(5, 5)),
-                'pool_3': nn.AvgPool2d(kernel_size=(7, 7)),
+            self.enc.append(
+                DownBlock(input_ch=input_dim, output_ch=output_dim, 
+                          downsample=True)
+            )
+            self.enc_img_size.append((H//2, W//2))
+        # Style
+        self.style_emb = 3 * 2
 
-                'style_rho': nn.Linear(3*3, 2)
-            }
-        )
-        self.eps = 1e-8
+        # Bottom
+        self.bottom = nn.ModuleList()
+        for i in range(len(bottom_dim_list)-1):
+            input_dim = bottom_dim_list[i]
+            output_dim = bottom_dim_list[i+1]
+            img_size = self.enc_img_size[-1]
+
+            self.bottom.append(
+                UpBlock(input_ch=input_dim, output_ch=output_dim, style_emb=self.style_emb, 
+                        upsample=False, img_size=img_size, shortcut=True,
+                        )
+            )
 
         # Decoder
         self.dec = nn.ModuleList()
-        dec_dim_list = list(reversed(enc_dim_list))
         for i in range(len(dec_dim_list)-1):
             input_dim = dec_dim_list[i]
             output_dim = dec_dim_list[i+1]
+            img_size = self.enc_img_size[len(dec_dim_list)-1-i]
 
-            if crr_dim != output_dim:
-                self.dec.append(
-                    UpResBlock(
-                            img_size=img_size,
-                            input_ch=input_dim, output_ch=output_dim, 
-                            act='lrelu', upsample=True)
-                    )
-            else:
-                self.dec.append(
-                UpResBlock(
-                    img_size=img_size,
-                    input_ch=input_dim, output_ch=output_dim, 
-                    act='lrelu', upsample=False)
-                )
+            self.dec.append(
+                UpBlock(input_ch=input_dim, output_ch=output_dim, style_emb=self.style_emb, 
+                            upsample=True, img_size=img_size, shortcut=False,
+                            )
+            )
 
         # Output
         self.out_conv = nn.Sequential(*[
-            Conv2dBlock(input_ch=enc_dim_list[0], output_ch=3, kernel_size=7, stride=1, padding=3,
-                        norm=None, act='tanh')
+            Conv2dBlock(input_ch=dec_dim_list[-1], output_ch=3, 
+                        kernel_size=7, stride=1, padding=3, pad_type="reflect",
+                        norm=None, act='tanh', use_bias=False)
             ])
         
-    def style_pool(self, x):
-        B, C, _, _ = x.size()
+        self.apply(init_weights)
 
-        y = None
-        for i in range(1, 3+1):
-            z = self.style_pooling["pool_{}".format(i)](x)
-            z = F.interpolate(z, size=(self.h_img_resize, self.w_img_resize), mode='bilinear', align_corners=True)
-            
-            if i == 1:
-                y = z.clone()
-            else:
-                y = torch.cat([y, z.clone()], dim=1)
-
-        c = F.adaptive_avg_pool2d(y, 1)
-        c = c.view(B, -1)
-        softmax = nn.Softmax(1)
-        rho = softmax(self.style_pooling["style_rho"](c))
-        # Norm
-        in_mean, in_var = torch.mean(y, dim=[2, 3], keepdim=True), torch.var(y, dim=[2, 3], keepdim=True)
-        input_in = (y - in_mean) / torch.sqrt(in_var + self.eps)
-        ln_mean, ln_var = torch.mean(y, dim=[1, 2, 3], keepdim=True), torch.var(y, dim=[1, 2, 3], keepdim=True)
-        input_ln = (y - ln_mean) / torch.sqrt(ln_var + self.eps)
-
-        out = rho[:, 0].view(B, 1, 1, 1) * input_in + rho[:, 1].view(B, 1, 1, 1) * input_ln
-
-        return out
+    def style_extractor(self, x, H, W):
+        y = F.adaptive_avg_pool2d(x, (H, W))
+        z = F.adaptive_max_pool2d(x, (H, W))
+        return torch.cat([y, z], dim=1)
 
     def forward(self, x, y):
-        src_content = x.clone()
-        src_style = y.clone()
-
+        src_H, src_W = y.shape[2], y.shape[3]
         # Encoder
+        enc_list = list()
         h = self.input_conv(x)
-        s = self.style_pool(y)
-        #enc_feats = []
         for idx, m in enumerate(self.enc):
             h = m(h)
-
+            enc_list.append(h.clone())
+        # Bottom
+        for idx, m in enumerate(self.bottom):
+            s = self.style_extractor(y, H=h.shape[2], W=h.shape[3])
+            h = m(h, ref=s)
+        # Decoder
         for idx, m in enumerate(self.dec):
+            s = self.style_extractor(y, H=h.shape[2]*2, W=h.shape[3]*2)
             h = m(h, ref=s)
 
         out = self.out_conv(h)
 
         return out
 
+# Weights init --------------------------------------
+def init_weights(m, mode="kaiming"):
+        classname = m.__class__.__name__
+        if (classname.find('Conv') == 0 or classname.find('Linear') == 0) and hasattr(m, 'weight'):
+            if mode == "normal":
+                nn.init.normal_(m.weight.data, 0.0, 0.02)
+            elif mode == "kaiming":
+                nn.init.kaiming_normal_(m.weight.data, a=0, mode="fan_in")
+            
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias.data, 0.0)

@@ -2,137 +2,157 @@ import math
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from torch.nn.parameter import Parameter
-from einops.layers.torch import Rearrange
+from torchvision.ops import DeformConv2d
 
 from SSIT.Model.blocks.basic_blocks import *
 
-# Noise -----------------------------------------------------------------
-class GaussianNoise(nn.Module):
-    def __init__(self, num_features):
+# Deformable Conv -------------------------------------------------------
+class DeformConv2d_for_Style(nn.Module):
+    def __init__(self, input_ch: int, output_ch: int,
+                 k:int, s:int, p:int):
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(num_features))
+        self.k = k
+        self.offset_mask = nn.Conv2d(input_ch, 2*k*k, 
+                                     kernel_size=k, stride=s, padding=p, 
+                                     padding_mode="reflect")
+        self.conv = DeformConv2d(input_ch, output_ch, k, s, p)
 
     def forward(self, x):
-        B = x.size()[0]
+        B = x.shape[0]
+        # kernel
+        x_offset = self.offset_mask(x)
+        o1, o2 = torch.chunk(x_offset, 2, dim=1)
+        offset = torch.concat([o1, o2], dim=1)
+        # conv
+        out = self.conv(x, offset=offset)
+        return out
+    
+# Noise -----------------------------------------------------------------
+class GaussianNoise(nn.Module):
+    def __init__(self, input_ch, img_size):
+        super().__init__()
+        self.input_ch = input_ch
+        self.noise_scaler = nn.Parameter(torch.randn(1, input_ch, 1, 1))
+    def forward(self, x):
+        B, C, H, W = x.size()
         # Add mean=0 std=1 Gaussian noise
-        noise = torch.randn(x.size()).to(x.device) * self.weight.view(1, -1, 1, 1)
-        return x + noise
+        noise = torch.randn([B, 1, H, W], device=x.device)
+        return x + noise * self.noise_scaler
 
 # Norm -------------------------------------------------------------------
 class DirectNorm2d(nn.Module):
-    def __init__(self, num_features: int, img_size:tuple, style_dim:int =256):
+    def __init__(self, input_ch: int, style_dim: int, **kargs):
         super().__init__()
+
         self.eps = 1e-8
-        self.input_norm = nn.InstanceNorm2d(num_features)
-        self.fc = nn.Sequential(*[
-                Conv2dBlock(3*3, num_features, 3, 1, 1, act='lrelu', norm=None)
-        ])
+        self.input_norm = nn.InstanceNorm2d(input_ch)
+
+        # Conv
+        k, s, p = 3, 1, 1
+        self.conv = DeformConv2d_for_Style(style_dim, input_ch, k, s, p)
+
 
     def forward(self, input, style):
         B, C, H, W = input.size()
         input = self.input_norm(input)
 
-
-        style = self.fc(style)
-        style_mean, style_var = torch.mean(style, dim=[2,3], keepdim=True), torch.var(style, dim=[2,3], keepdim=True)
+        s = self.conv(style)
+        style_mean, style_var = torch.mean(s, dim=[2,3], keepdim=True), torch.var(s, dim=[2,3], keepdim=True)
         style_std = torch.sqrt(style_var + self.eps)
+
         out = style_std * input + style_mean
 
         return out
 
 # Encoder -------------------------------------------------
 class DownBlock(nn.Module):
-    def __init__(self, input_ch: int, output_ch: int, k: int, s:int, p:int,
-                 act: str=None, norm: str="in"):
+    def __init__(self, input_ch: int, output_ch: int, hidden_ch: int=None,
+                 downsample: bool = False):
         super().__init__()
-
+        self.downsample = downsample
         self.input_ch = input_ch
         self.output_ch = output_ch
+        hidden_ch = input_ch if hidden_ch is None else hidden_ch
 
-        self.noise = GaussianNoise(input_ch)
-        self.conv = Conv2dBlock(input_ch=input_ch, output_ch=output_ch, kernel_size=k, stride=s, padding=p,
-                                norm=norm, act=act, act_inplace=False, act_first=True)
-        self.act = nn.PReLU()
-        self.norm = get_norm(norm, output_ch)
+        if self.downsample is True:
+            k, s, p = 3, 2, 1
+        else:
+            k, s, p = 3, 1, 1
 
-        
+        # Conv
+        self.conv0 = Conv2dBlock(input_ch=input_ch, output_ch=output_ch,
+                                kernel_size=k, stride=s, padding=p,
+                                norm="in", act="prelu")
+
     def forward(self, x):
-        x = self.noise(x)
+        h = x.clone() 
 
-        if self.norm is not None:
-            x = self.norm(x)
-
-        if self.act is not None:
-            x = self.act(x)
-        x = self.conv(x)
-        
-        return x
+        h = self.conv0(h)
+        return h
+    
 
 # Decoder -------------------------------------------------
-class UpResBlock(nn.Module):
-    def __init__(self, img_size: tuple, input_ch: int, output_ch: int, hidden_ch: int=None,
-                 act: str='lrelu', pad_type: str='reflect', upsample: bool=False):
+class UpBlock(nn.Module):
+    def __init__(self, img_size: tuple, input_ch: int, output_ch: int, style_emb: int, hidden_ch: int=None,
+                 upsample: bool=False, shortcut: bool=True, **kargs):
         super().__init__()
+        self.src_imgsize = img_size
         self.upsample = upsample
         self.input_ch = input_ch
         self.output_ch = output_ch
         
-        self.learned_shortcut = (input_ch != output_ch)
-        hidden_ch = input_ch if hidden_ch is None else hidden_ch
+        self.shortcut = shortcut
+        hidden_ch = output_ch if hidden_ch is None else hidden_ch
 
-        self.noise0 = GaussianNoise(input_ch)
-        # CNN
+        H1, W1 = img_size
         if self.upsample is True:
-            self.conv0 =  Conv2dBlock(input_ch//4, hidden_ch, 3, 1, 1, pad_type='reflect', norm=None, act=None)
+            H2 = H1*2
+            W2 = W1*2
         else:
-            self.conv0 =  Conv2dBlock(input_ch, hidden_ch, 3, 1, 1, pad_type='reflect', norm=None, act=None)
-        self.conv1 = Conv2dBlock(hidden_ch, output_ch, 3, 1, 1, pad_type='reflect', norm=None, act=None)
+            H2, W2 = img_size
+        k, s, p = 3, 1, 1
 
-        if self.learned_shortcut is True:
-            if self.upsample is True:
-                self.conv_s = Conv2dBlock(input_ch//4, output_ch, 1, 1, 0, pad_type='reflect', norm=None, act=None)
-            else:
-                self.conv_s = Conv2dBlock(input_ch, output_ch, 1, 1, 0, pad_type='reflect', norm=None, act=None)
-        # BatchNorm
+        # Layer1: C -> B -> R 
         if self.upsample is True:
-            self.norm0 = DirectNorm2d(input_ch//4, img_size=img_size)
+            self.conv0 =  nn.Conv2d(input_ch//4, hidden_ch, 
+                                    k, s, p, padding_mode="reflect")
         else:
-            self.norm0 = DirectNorm2d(input_ch, img_size=img_size)
-        self.norm1 = DirectNorm2d(hidden_ch, img_size=img_size)
-        # Act
+            self.conv0 =  nn.Conv2d(input_ch, hidden_ch, 
+                                    k, s, p, padding_mode="reflect")
+
+        self.noise0 = GaussianNoise(hidden_ch, img_size=(H1, W1))
+        self.norm0 = DirectNorm2d(hidden_ch, style_dim=style_emb)
         self.act0 = nn.PReLU()
+
+        # Layer2: C -> B -> R 
+        self.conv1 =  nn.Conv2d(hidden_ch, output_ch, 
+                                k, s, p, padding_mode="reflect")
+        self.noise1 = GaussianNoise(hidden_ch, img_size=(H2, W2))
+        self.norm1 = DirectNorm2d(hidden_ch, style_dim=style_emb)
         self.act1 = nn.PReLU()
+
         # Upsample
         if self.upsample is True:
             self.up = nn.PixelShuffle(upscale_factor=2)
 
-    def shortcut(self, x):
-        if self.upsample is True:
-            x = self.up(x)
-
-        if self.learned_shortcut:
-            x_s = self.conv_s(x)
-        else:
-            x_s = x
-
-        return x_s
-
     def forward(self, x, ref):
-        x_s = self.shortcut(x)
+        h = x.clone()
 
         if self.upsample is True:
-            x = self.up(x)
+            h = self.up(h)
 
-        h = self.norm0(x, style=ref)
-        h = self.act0(h)
         h = self.conv0(h)
-        
+        h = self.noise0(h)
+        h = self.norm0(h, style=ref)
+        h = self.act0(h)
+
+        h = self.conv1(h)
+        h = self.noise1(h)
         h = self.norm1(h, style=ref)
         h = self.act1(h)
-        h = self.conv1(h)
+
+        if self.shortcut is True:
+            return h + x
+        else:
+            return h
         
-
-        out = h + x_s
-
-        return out

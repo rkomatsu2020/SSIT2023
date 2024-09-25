@@ -1,30 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
-
-def onehot_encode(trgDomain, domain_num, scalar=None):
-    eye = torch.eye(domain_num)
-    eye = eye[trgDomain].view(-1, domain_num)
-    if scalar is None:
-        return eye
-    else:
-        return eye * scalar
-    
-def onehot_tile(is_real, input, trgDomain, domain_num: int):
-    B, C, H, W = input.size()
-    if is_real is True:
-        rnd_scaler = 0.9 + (1 - 0.9) * torch.rand((B, domain_num))
-        code = onehot_encode(trgDomain=trgDomain.data.cpu(), domain_num=domain_num) * rnd_scaler
-    else:
-        rnd_scaler = (1 - 0.9) * torch.rand((B, domain_num))
-        code = torch.ones((B, domain_num)) * rnd_scaler
-
-    code = code.view(B, domain_num, 1, 1)
-    out = code.expand((B, C, H, W))
-
-    return out.to(input.device)
-
-
+from SSIT.config import model_setting
 
 class GANLoss(nn.Module):
     def __init__(self, domain_num, loss, device):
@@ -42,7 +20,8 @@ class GANLoss(nn.Module):
         if is_real:
             create_label = ((self.real_label_var is None) or (self.real_label_var.numel() != input.numel()))
             if create_label:
-                rnd = 0.9 + (1 - 0.9) * torch.rand_like(input.data.cpu())
+                #rnd = 0.9 + (1 - 0.9) * torch.rand_like(input.data.cpu())
+                rnd = 0.9
                 real_tensor = torch.ones(input.size()) * rnd
                 if torch.cuda.is_available():
                     real_tensor = real_tensor.to(self.device)
@@ -50,7 +29,8 @@ class GANLoss(nn.Module):
         else:
             create_label = ((self.fake_label_var is None) or (self.fake_label_var.numel() != input.numel()))
             if create_label:
-                rnd = 0 + (0.1 - 0) * torch.rand_like(input.data.cpu())
+                #rnd = 0 + (0.1 - 0) * torch.rand_like(input.data.cpu())
+                rnd = 0.1
                 fake_tensor = torch.ones(input.size()) * rnd
                 if torch.cuda.is_available():
                     fake_tensor = fake_tensor.to(self.device)
@@ -58,91 +38,81 @@ class GANLoss(nn.Module):
         
         return target_tensor
 
-    def __call__(self, inputs, is_real, target_idx=None):
+    def __call__(self, inputs, is_real):
         loss = 0
         if isinstance(inputs, list):
             for i in inputs:
-                if target_idx is None:
-                    target_tensor = self.get_target_tensor(input=i, is_real=is_real)
-                else:
-                    target_tensor = onehot_tile(input=i, is_real=is_real, trgDomain=target_idx, domain_num=self.domain_num)
-                
+                target_tensor = self.get_target_tensor(input=i, is_real=is_real)
                 loss += self.loss(i, target_tensor)
 
         else:
-            if target_idx is None:
-                target_tensor = self.get_target_tensor(input=inputs, is_real=is_real)
-            else:
-                target_tensor = onehot_tile(input=inputs, is_real=is_real, trgDomain=target_idx, domain_num=self.domain_num)
+            target_tensor = self.get_target_tensor(input=inputs, is_real=is_real)
             loss = self.loss(inputs, target_tensor)
 
         return loss
-
-def vgg_normalization(img):
-    img = (img + 1) / 2 # convert [-1, 1] to [0, 1] (mean=-1, std=2)
-    device = img.device
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(-1, 1, 1).to(device)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(-1, 1, 1).to(device)
-
-    return (img - mean) / std
-
-class VGGLoss(nn.Module):
-    def __init__(self, device:str, vgg:nn.Module):
-        super(VGGLoss, self).__init__()
-        self.vgg = vgg.to(device)
-        self.content_criterion = nn.L1Loss()
-
-    def calc_content_loss(self, x, y):
-        B, C, H, W = x.size()
-        x = vgg_normalization(x)
-        y = vgg_normalization(y)
-        
-        x_vgg, y_vgg = self.vgg(x, mode='content'), self.vgg(y, mode='content')
-        
-        loss = 0
-        for i in range(len(x_vgg)):
-            weight = 1 / pow(2, (len(x_vgg)-1-i))
-            loss += weight * self.content_criterion(x_vgg[i], y_vgg[i].detach())
-        return loss
-
-
-    def forward(self, x, y, mode='content'):
-        if mode == 'content':
-            return self.calc_content_loss(x, y)
-        elif mode == 'style':
-            return self.calc_style_loss(x, y)
-
-def gradient_penalty(y, x):
-    weight = torch.ones(y.size()).to(y.device)
-    dydx = torch.autograd.grad(outputs=y,
-                               inputs=x,
-                               grad_outputs=weight,
-                               retain_graph=True,
-                               create_graph=True,
-                               only_inputs=True)[0]
-    dydx = dydx.view(dydx.size(0), -1)
-    dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
-    return torch.mean((dydx_l2norm-1)**2)
-
-class StyleMeanStdLoss(nn.Module):
-    def __init__(self):
+    
+def tv_loss(img, tv_weight):
+    B, C, H, W = img.size()
+    w_var = torch.sum(torch.pow(img[:,:,:,:-1] - img[:,:,:,1:], 2))
+    h_var = torch.sum(torch.pow(img[:,:,:-1,:] - img[:,:,1:,:], 2))
+    loss = tv_weight * (h_var + w_var) / (B * C * H * W)
+    return loss
+    
+class ViTLoss(nn.Module):
+    def __init__(self, vit:nn.Module):
         super().__init__()
-        self.criterion = nn.MSELoss()
+        self.vit = vit
+        self.content_loss = nn.L1Loss()
+        self.style_loss = nn.MSELoss()
+        '''ViT memo:
+        self.ViT = VitExtractor(device=device)
+        class_pos_embed = self.pos_embed[:, 0]
+        patch_pos_embed = self.pos_embed[:, 1:]
+        '''
 
-    def forward(self, x, y):
-        x_mean, x_std = self.calc_mean_std(x)
-        y_mean, y_std = self.calc_mean_std(y)
+    def calc_content_loss(self, outputs, targets):
+        def attn_cosine_sim(x, eps=1e-08):
 
-        mean_loss = self.criterion(x_mean, y_mean)
-        std_loss = self.criterion(x_std, y_std)
+            norm1 = x.norm(dim=2, keepdim=True)
+            factor = torch.clamp(norm1 @ norm1.permute(0, 2, 1), min=eps)
+            sim_matrix = (x @ x.permute(0, 2, 1)) / factor
+            return sim_matrix
 
-        return mean_loss + std_loss
+        #layers = [i for i in range(11+1)]
+        layers = [6]
+        weight = [2**(-(len(layers)-1-i)) for i in range(len(layers))]
 
-    def calc_mean_std(self, x, eps=1e-8):
-        B, C, H, W = x.size()
-        x_mean = x.view(B, C, -1).mean(dim=2).view(B, C, 1, 1)
+        B = outputs.shape[0]
+        outputs = self.vit.vit_input_img_normalization(outputs)
+        targets = self.vit.vit_input_img_normalization(targets)
+        outputs = self.vit.get_features(outputs, layers)
+        targets = self.vit.get_features(targets, layers)
 
-        x_var = x.view(B, C, -1).var(dim=2) + eps
-        x_std = torch.sqrt(x_var).view(B, C, 1, 1)
+        loss = 0
+        for idx,(x,y) in enumerate(zip(outputs, targets)):
+            x = attn_cosine_sim(x)
+            y = attn_cosine_sim(y)
+            loss += self.content_loss(x, y.detach()) * weight[idx]
+            
+        return loss
+    
+    def calc_style_loss(self, outputs, targets):
+        '''
+        outputs: translated images
+        targets: ref images
+        '''
+        layers = [11]
+        weight = [1]
+        B = outputs.shape[0]
+        outputs = self.vit.vit_input_img_normalization(outputs)
+        targets = self.vit.vit_input_img_normalization(targets)
+        outputs = self.vit.get_features(outputs, layers)
+        targets = self.vit.get_features(targets, layers)
 
-        return x_mean, x_std
+        loss = 0
+        for idx,(x,y) in enumerate(zip(outputs, targets)):
+            x = x[:, 0, :]
+            y = y[:, 0, :]
+            loss += self.style_loss(x, y.detach()) * weight[idx]
+
+        return loss

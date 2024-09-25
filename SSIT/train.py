@@ -15,7 +15,7 @@ from Utils.DataParser.set_dataset_path import set_dataset_path
 from Utils.ModelParser.model_parser import set_and_get_save_dir, save_models, load_model
 
 from SSIT.Model.net import Generator, Discriminator
-from SSIT.Model.vgg import VGG19
+from SSIT.Model.ViT import *
 from SSIT.Model.loss import *
 from SSIT.config import model_setting
 from test_Guided_Trans import Test
@@ -56,16 +56,13 @@ class TrainSSIT():
         self.lambda_adv = float(model_setting['lambda_adv'][adv_weight])
         self.lambda_cyc = float(model_setting['lambda_cyc'][cyc_weight])
         self.lambda_style = float(model_setting['lambda_style'][style_weight])
+        self.tv_weight = float(model_setting['lambda_tv'])
         self.unrolled_steps = model_setting['unroll_steps']
         # About save model path
-        self.trained_models_dir_path = set_and_get_save_dir(self.model_name,
-                                                        '@trained_with_{}(c={} s={} a={})'.format(dataset_name, self.lambda_cyc, self.lambda_style, self.lambda_adv)
-                                                        )
+        self.trained_models_dir_path = set_and_get_save_dir(self.model_name, dataset_name)
         # Set model & path
         self.netG = Generator(img_size=img_size, input_ch=3).to(self.device)
         self.netD = Discriminator(img_size=img_size, input_ch=3, domain_num=self.domain_num).to(self.device)
-        self.netG.apply(self.init_weights)
-        self.netD.apply(self.init_weights)
         # Set Optimizers
         lr = 0.0002
         self.g_lr = lr/2
@@ -77,10 +74,8 @@ class TrainSSIT():
         self.scheduler_G = torch.optim.lr_scheduler.MultiStepLR(optimizer=self.optimizer_G, milestones=[self.total_iter//2, self.total_iter//4*3], gamma=0.1)
         self.scheduler_D = torch.optim.lr_scheduler.MultiStepLR(optimizer=self.optimizer_D, milestones=[self.total_iter//2, self.total_iter//4*3], gamma=0.1)
         # Set loss
-        self.VGG_Loss = VGGLoss(self.device, VGG19())
+        self.ViT_Loss = ViTLoss(VitExtractor(self.device, model_name=model_setting["ViT_name"]))
         self.Adv_Loss = GANLoss(loss=nn.MSELoss(), device=self.device, domain_num=self.domain_num)
-        self.Style_Loss = nn.L1Loss()
-        self.Cls_Loss = nn.CrossEntropyLoss()
         # Set test
         self.test = Test(gpu_no=gpu_no, dataset_name=dataset_name, model_config=model_setting)
 
@@ -207,26 +202,19 @@ class TrainSSIT():
     def update_G(self, As: tuple, Bs: tuple, **kargs): 
         A, A_domain = As
         B, B_domain = Bs
+
         lossG = {}
         self.optimizer_G.zero_grad()
         # Generate fake img
         A2B = self.netG(A, B)
         # Discriminate
-        pred_fake = self.netD(input=A2B)
+        pred_fake = self.netD(input=A2B, domain=B_domain)
         lossG['Adv_Fake'] = self.Adv_Loss(pred_fake.adv_patch, True) * self.lambda_adv
-        lossG['Adv_Fake(CAM)'] = self.Adv_Loss(pred_fake.cam_logit, True) * self.lambda_adv
-        lossG['Adv_Fake(Cls)'] = self.Cls_Loss(pred_fake.pred_class, B_domain)
+        lossG['Content_Feat'] = self.ViT_Loss.calc_content_loss(A2B, A) * self.lambda_cyc
+        lossG['Style_Feat'] = self.ViT_Loss.calc_style_loss(A2B, B) * self.lambda_style
+        lossG['TV_Loss'] = tv_loss(A2B,  tv_weight=self.tv_weight)
+        #lossG["Cls_Fake"] = self.Cls_Loss(pred_fake.pred_cls, B_domain)
 
-        pred_real = self.netD(input=B)
-        sum_feat_loss = 0
-        for idx, (fake_feats, real_feats) in enumerate(zip(pred_fake.feats, pred_real.feats)):
-            for fake, real in zip(fake_feats, real_feats):
-                feat_loss = self.Style_Loss(fake, real.detach())
-                sum_feat_loss += feat_loss
-        lossG['Style_Feat'] = sum_feat_loss * self.lambda_style
-
-        lossG['Content_Feat(VGG)'] = self.VGG_Loss(A2B, A, 'content') * self.lambda_cyc
-        
         loss = sum(lossG.values())
         loss.backward()
         self.optimizer_G.step()
@@ -236,38 +224,28 @@ class TrainSSIT():
             print('\t\t{}:{:.5f}'.format(k, v.item()))
 
 
-    def update_D(self, As: tuple, Bs: tuple, 
-                 output_log=True, **kargs): 
+    def update_D(self, As: tuple, Bs: tuple, **kargs): 
         A, A_domain = As
         B, B_domain = Bs
-        
+
         lossD = {}
         B.requires_grad_()
         self.optimizer_D.zero_grad()
         with torch.no_grad():
             A2B = self.netG(A, B)
         # Discriminate
-        pred_real = self.netD(input=B)
-        pred_fake = self.netD(input=A2B.detach())
+        pred_real = self.netD(input=B, domain=B_domain)
+        pred_fake = self.netD(input=A2B.detach(), domain=B_domain)
 
         lossD['Adv_Real'] = self.Adv_Loss(pred_real.adv_patch, True) * self.lambda_adv
         lossD['Adv_Fake'] = self.Adv_Loss(pred_fake.adv_patch, False) * self.lambda_adv
-        lossD['Adv_Real(CAM)'] = self.Adv_Loss(pred_real.cam_logit, True) * self.lambda_adv
-        lossD['Adv_Fake(CAM)'] = self.Adv_Loss(pred_fake.cam_logit, False) * self.lambda_adv
-        lossD['Adv_Real(Cls)'] = self.Cls_Loss(pred_real.pred_class, B_domain)
+        #lossD["Cls_Real"] = self.Cls_Loss(pred_real.pred_cls, B_domain)
+        #lossD["Cls_Fake"] = self.Cls_Loss(pred_fake.pred_cls, A_domain)
 
         loss = sum(lossD.values())
         loss.backward()
         self.optimizer_D.step()
 
-        if output_log is True:
-            print('\tDiscriminator')
-            for k, v in lossD.items():
-                print('\t\t{}:{:.5f}'.format(k, v.item()))
-
-    def init_weights(self, m):
-        classname = m.__class__.__name__
-        if (classname.find('Conv') == 0 or classname.find('Linear') == 0) and hasattr(m, 'weight'):
-            nn.init.normal_(m.weight.data, 0.0, 0.02)
-            if hasattr(m, 'bias') and m.bias is not None:
-                nn.init.constant_(m.bias.data, 0.0)
+        print('\tDiscriminator')
+        for k, v in lossD.items():
+            print('\t\t{}:{:.5f}'.format(k, v.item()))

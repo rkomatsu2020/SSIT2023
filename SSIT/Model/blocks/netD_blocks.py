@@ -2,75 +2,137 @@ from munch import Munch
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.utils.spectral_norm as spectral_norm
 
-from SSIT.Model.blocks.basic_blocks import Conv2dBlock, ActFirstResBlock, ResBlock
+from SSIT.config import netD_params
 
-
-class ActConvDown(nn.Module):
-    def __init__(self, input_ch: int, domain_num:int, base_dim: int, n_layers: int):
+class ViTDiscriminator(nn.Module):
+    def __init__(self, input_ch: int, **kargs):
         super().__init__()
-        self.netD = nn.ModuleDict()
-        self.n_layers = n_layers
-        # Input Conv
-        self.netD["conv_0"] = Conv2dBlock(input_ch=input_ch, output_ch=base_dim, kernel_size=3, stride=1, padding=1,
-                                        norm=None, act=None, act_inplace=False, use_spectral=False)
-        # Hidden Conv
-        crr_dim = base_dim
-        for j in range(1, self.n_layers):
-            output_dim = min(crr_dim*2, 256)
-            #self.netD["norm_{}".format(j)] = DirectNorm2d(num_features=crr_dim)
-            #self.netD["conv_{}".format(j)] = ActFirstResBlock(input_ch=crr_dim, output_ch=output_dim, 
-            #                                                  act="lrelu", act_inplace=False, downsample=True, use_spectral=True)
-            self.netD["conv_{}".format(j)] = Conv2dBlock(input_ch=crr_dim, output_ch=output_dim, kernel_size=3, stride=2, padding=1,
-                                                              act="lrelu", act_inplace=False, use_spectral=True)
+        img_size = kargs["img_size"]
+        hidden_dim_list = netD_params["hidden_dim"]
+        head_num = netD_params["head_num"]
+        patch_size = netD_params["patch_size"]
+        domain_num = kargs["domain_num"]
+
+        patch_num = img_size[0]//patch_size * img_size[1]//patch_size
+        patch_elements = 3 * patch_size * patch_size
+
+
+        self.patch = Patches(patch_size=patch_size)
+        self.patch_emb = PatchEmbedding(patch_elements=patch_elements, patch_num=patch_num, emb_dim=hidden_dim_list[0])
+
+        self.trans_block = nn.ModuleDict()
+        for i in range(1, len(hidden_dim_list)):
+            self.trans_block["net{}".format(i)] = Transformer(input_dim=hidden_dim_list[i-1], 
+                                                              output_dim=hidden_dim_list[i],
+                                                              num_heads=head_num)
             
-            
-            crr_dim = output_dim
-        # Output CAM logit
-        self.gap_fc = nn.utils.spectral_norm(nn.Linear(crr_dim, 1, bias=False))
-        self.gmp_fc = nn.utils.spectral_norm(nn.Linear(crr_dim, 1, bias=False))
-        self.conv1x1 = Conv2dBlock(input_ch=crr_dim*2, output_ch=crr_dim, kernel_size=1, stride=1, act="lrelu", use_spectral=False, act_first=True, act_inplace=False)
-        self.cam_lambda = nn.Parameter(torch.zeros(1))
-        # Output conv
-        self.netD["out"] = nn.Sequential(*[nn.LeakyReLU(0.2, False), nn.Conv2d(crr_dim, 1, 4, 1, 0)])
-        self.output_dim = crr_dim
+        self.last_block = Transformer(input_dim=hidden_dim_list[-1],
+                                      output_dim=hidden_dim_list[-1],
+                                      num_heads=head_num)
+        self.last_logits = nn.Linear(hidden_dim_list[-1], 1, bias=False)
 
-    def get_cam_logit(self, x):
-        x0 = x.clone()
-        gap = torch.nn.functional.adaptive_avg_pool2d(x, 1)
-        gap_logit = self.gap_fc(gap.view(x.shape[0], -1))
-        gap_weight = list(self.gap_fc.parameters())[0]
-        gap = x * gap_weight.unsqueeze(2).unsqueeze(3)
+    def forward(self, x, **kargs):
+        B = x.size()[0]
+        c = kargs["domain"]
 
-        gmp = torch.nn.functional.adaptive_max_pool2d(x, 1)
-        gmp_logit = self.gmp_fc(gmp.view(x.shape[0], -1))
-        gmp_weight = list(self.gmp_fc.parameters())[0]
-        gmp = x * gmp_weight.unsqueeze(2).unsqueeze(3)
-        # Output feat
-        x = torch.cat([gap, gmp], 1)
-        out = self.conv1x1(x) * self.cam_lambda + x0
-        # Output CAM
-        cam_logit = torch.cat([gap_logit, gmp_logit], 1)
-
-        return cam_logit, out
-
-    def forward(self, x):
-        feats = list()
-        h = x.clone()
-
-        for j in range(self.n_layers):
-            h = self.netD["conv_{}".format(j)](h)
-            if j != 0:
-                # Append feats
-                feats.append(h.clone())
-
-        # Append CAM
-        cam_out, h = self.get_cam_logit(h)
-        # Append patch
-        out = self.netD["out"](h)
+        h = self.patch(x)
+        h = self.patch_emb(h)
+        # Hidden Transformar Blocks
+        for k in self.trans_block.keys():
+            h = self.trans_block[k](h)
+        # Last Transformer block
+        out = self.last_block(h)
+        out = self.last_logits(out)
         # Select by c
         #idx = torch.LongTensor(range(c.size(0))).to(x.device)
         #out = out[idx, c]
 
-        return Munch(feats=feats, cam_out=F.sigmoid(cam_out), 
-                     out=F.sigmoid(out))
+        return {"patch":F.sigmoid(out)}
+
+class Patches(nn.Module):
+    def __init__(self, patch_size):
+        super().__init__()
+
+        self.patch_size = patch_size
+
+    def forward(self, x):
+        '''
+        x:[B, C, H, W]
+        out: [B, N, C*p1*p2] (N: H//p1*W//p2)
+        '''
+        B, C, H, W = x.size()
+        p = x.unfold(2, self.patch_size, self.patch_size) # B, C, H, W -> B, C, H_p1, W, H_p2
+        p = p.unfold(3, self.patch_size, self.patch_size) # B, C, H_p1, W, H_p2 -> B, C, H_p1, W_p1, H_p2, W_p2
+        p = p.contiguous().view(B, C, -1, self.patch_size, self.patch_size) # B, C, H_p1, W_p1, H_p2, W_p2 -> B, C, N, p1, p2
+        p = p.permute(0, 2, 1, 3, 4).contiguous().view(B, -1, self.patch_size * self.patch_size * C) # B, C, N, p1, p2 -> B, N, C*p1*p2
+        return p
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, patch_elements, patch_num, emb_dim):
+        super().__init__()
+        self.patch_elements = patch_elements
+        self.patch_num = patch_num
+        self.proj_fc = spectral_norm(nn.Linear(patch_elements, emb_dim))
+        self.position_embedding = nn.Embedding(patch_num, emb_dim)
+
+    def forward(self, x):
+        B = x.size()[0]
+
+        positions = torch.arange(self.patch_num, device=x.device).unsqueeze(0).repeat(B, 1)
+        #x = F.adaptive_avg_pool1d(, 1).squeeze(-1)
+        p = self.proj_fc(x)
+        q = self.position_embedding(positions) # [B, N, dim]
+        encoded = p + q
+        return encoded
+    
+class Transformer(nn.Module):
+    def __init__(self, input_dim, output_dim, num_heads=8):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(input_dim, eps=1e-6)
+        self.attn = MultiHeadAttention_D(emb_dim=input_dim, output_dim=output_dim, num_heads=num_heads)
+        self.norm2 = nn.LayerNorm(input_dim, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, output_dim, bias=False),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        x1 = self.norm1(x)
+        attn= self.attn(x1)
+        x2 = attn + x
+        x3 = self.norm1(x2)
+        x3 = self.mlp(x3)
+        out = x2 + x3
+        return out
+
+
+class MultiHeadAttention_D(nn.Module):
+    def __init__(self, emb_dim, output_dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.scale = emb_dim ** (0.5)
+
+        self.qkv = spectral_norm(nn.Linear(emb_dim, emb_dim*3))
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj = spectral_norm(nn.Linear(emb_dim, output_dim))
+
+    def forward(self, x):
+        B, N, C = x.size()
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C//self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4) # -> (3, B, heads, N, C//heads)
+        q,k,v = qkv[0], qkv[1], qkv[2]
+
+        energy = (q @ k.transpose(-2, -1)) / self.scale # -> (B, heads, N, C//heads) @ (B, heads, C//heads,  N) -> (B, heads, N, N)
+        attn = F.softmax(energy, dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = (attn @ v).transpose(1, 2) # (B, heads, N, N) @ (B, heads, N, C//heads) -> (B, heads, N, C//heads) -> (B, N, heads, C//heads)
+        out = out.reshape(B, N, C)
+        out = self.proj(out)
+
+        return out
