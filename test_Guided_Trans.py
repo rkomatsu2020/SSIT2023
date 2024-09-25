@@ -23,18 +23,7 @@ class Test():
         self.dataset_name = dataset_name
         self.img_size = model_config['img_size']['default'] if dataset_name not in model_config['img_size'].keys() else model_config['img_size'][dataset_name]
         # About trained model path
-        adv_weight = 'default' if dataset_name not in model_config['lambda_adv'].keys() else dataset_name
-        cyc_weight = 'default' if dataset_name not in model_config['lambda_cyc'].keys() else dataset_name
-        style_weight = 'default' if dataset_name not in model_config['lambda_style'].keys() else dataset_name
-
-        self.lambda_adv = float(model_config['lambda_adv'][adv_weight])
-        self.lambda_cyc = float(model_config['lambda_cyc'][cyc_weight])
-        self.lambda_style = float(model_config['lambda_style'][style_weight])
-        # Get trained dir
-        self.trained_model_dir = set_and_get_save_dir(self.model_name,
-                                                        '@trained_with_{}(c={} s={} a={})'.format(dataset_name, self.lambda_cyc, self.lambda_style, self.lambda_adv)
-                                                        )
-
+        self.trained_model_dir = set_and_get_save_dir(self.model_name, dataset_name)
         # Init loader & model
         self.has_loader = False
         self.loaded_trained_model = False
