@@ -1,6 +1,10 @@
 # SSIT2023
 This repository is the implementation of SSIT: Single-Stream Image-to-Image Translation [Paper](https://www.computer.org/csdl/journal/oj/2024/01/10694773/20wCWTplz7W)
 We provide the implement of our SSIT with Pyotrch. 
+
+![SSIT](https://github.com/user-attachments/assets/abca76c5-1a3f-473a-80aa-f711ec41b7fc)
+
+
 # Requirements
 - Python 3.x
 - CPU or NVIDIA GPU
