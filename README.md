@@ -9,7 +9,10 @@ We provide the implement of our SSIT with Pyotrch.
 - pytorch
 - munch
 # Training
-
+If you train with your custom dataset, please place the dataset under the directory @Dataset. And start train with your code:\n
+```
+python trainer.py -src "custom dataset" -train_dirA "trainA" -train_dirB "trainB" -test_dirA "testA" -testB "testB"
+```
 # Citation
 If you use our code for your study, please cite: 
 ```bibtex
